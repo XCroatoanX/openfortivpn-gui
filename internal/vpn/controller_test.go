@@ -3,6 +3,8 @@ package vpn
 import (
 	"context"
 	"errors"
+	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -303,7 +305,9 @@ func TestController_BuildCommandArgs(t *testing.T) {
 			},
 		},
 		{
-			name: "otp auth passes --otp flag and keeps username",
+			// SECURITY: the OTP must never appear in argv — it is delivered
+			// via stdin (see TestController_Connect_OTP_DeliversPasswordAndOTP).
+			name: "otp auth keeps username and never puts the otp in argv",
 			p: &profile.Profile{
 				Host: host, Port: port, Username: "testuser",
 				AuthMethod: profile.AuthMethodOTP,
@@ -313,14 +317,13 @@ func TestController_BuildCommandArgs(t *testing.T) {
 			want: []string{
 				"vpn.example.com:443",
 				"-u", "testuser",
-				"--otp=123456",
 				"--set-dns=1",
 				"--set-routes=1",
 				"--half-internet-routes=0",
 			},
 		},
 		{
-			name: "otp auth without otp value omits --otp flag",
+			name: "otp auth without otp value produces same argv",
 			p: &profile.Profile{
 				Host: host, Port: port, Username: "testuser",
 				AuthMethod: profile.AuthMethodOTP,
@@ -395,11 +398,11 @@ func TestController_BuildCommandArgs(t *testing.T) {
 	}
 }
 
-// TestController_Connect_OTP_DeliversPasswordAndOTP verifies that a single 2FA
-// connection delivers BOTH credentials by their respective channels: the
-// one-time password as the --otp command-line flag, and the account password
-// via stdin (never argv). This is the end-to-end guarantee that a 2FA connect
-// passes everything openfortivpn needs.
+// TestController_Connect_OTP_DeliversPasswordAndOTP verifies that a 2FA
+// connection delivers BOTH credentials via stdin — password first (answering
+// openfortivpn's password prompt), then the one-time password (answering the
+// "Two-factor authentication token:" prompt). Neither secret may ever appear
+// in argv, which is world-readable via /proc/<pid>/cmdline.
 func TestController_Connect_OTP_DeliversPasswordAndOTP(t *testing.T) {
 	executor := NewMockExecutor()
 	ctrl := NewController("/usr/bin/openfortivpn", WithExecutor(executor))
@@ -421,19 +424,97 @@ func TestController_Connect_OTP_DeliversPasswordAndOTP(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// OTP is delivered as a command-line flag.
-	args := executor.GetLastArgs()
-	assert.Contains(t, args, "--otp=123456", "OTP must be passed via the --otp flag")
-
-	// Password is delivered via stdin and must NEVER appear in argv.
-	for _, arg := range args {
+	// Neither credential may appear in argv.
+	for _, arg := range executor.GetLastArgs() {
 		assert.NotContains(t, arg, "topsecret", "password must never appear in command-line arguments")
+		assert.NotContains(t, arg, "123456", "OTP must never appear in command-line arguments")
 	}
+
+	// Both credentials are delivered via stdin, password first.
 	assert.Eventually(t, func() bool {
-		return executor.GetProcess().GetStdinContent() == "topsecret\n"
-	}, 100*time.Millisecond, 10*time.Millisecond, "password must be written to stdin")
+		return executor.GetProcess().GetStdinContent() == "topsecret\n123456\n"
+	}, 100*time.Millisecond, 10*time.Millisecond, "password then OTP must be written to stdin")
 
 	// Cleanup
+	executor.GetProcess().CompleteProcess()
+}
+
+// TestController_Connect_OTPWithoutPassword_DeliversOTP verifies that the OTP
+// still reaches stdin when no account password is supplied.
+func TestController_Connect_OTPWithoutPassword_DeliversOTP(t *testing.T) {
+	executor := NewMockExecutor()
+	ctrl := NewController("/usr/bin/openfortivpn", WithExecutor(executor))
+
+	p := &profile.Profile{
+		ID:         "550e8400-e29b-41d4-a716-446655440000",
+		Name:       "Test VPN",
+		Host:       "vpn.example.com",
+		Port:       443,
+		Username:   "testuser",
+		AuthMethod: profile.AuthMethodOTP,
+		SetDNS:     true,
+		SetRoutes:  true,
+	}
+
+	err := ctrl.Connect(context.Background(), p, &ConnectOptions{OTP: "654321"})
+	require.NoError(t, err)
+
+	assert.Eventually(t, func() bool {
+		return executor.GetProcess().GetStdinContent() == "654321\n"
+	}, 100*time.Millisecond, 10*time.Millisecond, "OTP must be written to stdin even without a password")
+
+	executor.GetProcess().CompleteProcess()
+}
+
+// TestController_OutputProcessing_LongLine verifies that output lines longer
+// than bufio.Scanner's 64 KiB default are still delivered instead of silently
+// killing the output-processing goroutine.
+//
+// Regression test: the scanners previously used the default buffer, so one
+// long line stopped all event parsing for the rest of the connection.
+func TestController_OutputProcessing_LongLine(t *testing.T) {
+	executor := NewMockExecutor()
+	ctrl := NewController("/usr/bin/openfortivpn", WithExecutor(executor))
+
+	// One line well past the 64 KiB default cap, followed by a parseable event.
+	longLine := strings.Repeat("x", 100*1024)
+	process := executor.GetProcess()
+	process.WriteToStdout(longLine)
+	process.WriteToStdout("Tunnel is up and running.")
+
+	var gotLong, gotTunnelUp bool
+	var mu sync.Mutex
+	ctrl.OnOutput(func(line string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if line == longLine {
+			gotLong = true
+		}
+		if line == "Tunnel is up and running." {
+			gotTunnelUp = true
+		}
+	})
+
+	p := &profile.Profile{
+		ID:         "550e8400-e29b-41d4-a716-446655440000",
+		Name:       "Test VPN",
+		Host:       "vpn.example.com",
+		Port:       443,
+		Username:   "testuser",
+		AuthMethod: profile.AuthMethodPassword,
+		SetDNS:     true,
+		SetRoutes:  true,
+	}
+
+	require.NoError(t, ctrl.Connect(context.Background(), p, &ConnectOptions{Password: "pw"}))
+
+	assert.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return gotLong && gotTunnelUp
+	}, 2*time.Second, 10*time.Millisecond,
+		"long line and subsequent output must both be delivered")
+
 	executor.GetProcess().CompleteProcess()
 }
 
@@ -962,11 +1043,25 @@ func TestController_Disconnect_KillError(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, StateConnecting, ctrl.GetState())
 
+	// Wrap the real cancel func in a spy so we can assert the context is
+	// released even when Kill fails. Regression guard: Disconnect cancels via
+	// a deferred call so the early return on Kill error still runs it; dropping
+	// that would leak the context and the goroutines that hold it.
+	var cancelCalled bool
+	ctrl.mu.Lock()
+	realCancel := ctrl.cancel
+	ctrl.cancel = func() {
+		cancelCalled = true
+		realCancel()
+	}
+	ctrl.mu.Unlock()
+
 	// Now try to disconnect - should return the Kill error
 	err = ctrl.Disconnect(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to kill VPN process")
 	assert.Contains(t, err.Error(), "authentication cancelled")
+	assert.True(t, cancelCalled, "cancel must run even when Kill fails, to release the context")
 }
 
 func TestController_ProcessCompletion_AutoDisconnect(t *testing.T) {
@@ -995,4 +1090,58 @@ func TestController_ProcessCompletion_AutoDisconnect(t *testing.T) {
 	assert.Eventually(t, func() bool {
 		return ctrl.GetState() == StateDisconnected
 	}, 100*time.Millisecond, 10*time.Millisecond)
+}
+
+// TestController_Disconnect_GracefulBeforeContextCancel verifies that Disconnect
+// delivers the graceful SIGTERM (and its grace window) BEFORE cancelling the
+// process context.
+//
+// The process is launched with exec.CommandContext, so cancelling the context
+// SIGKILLs the child. If cancel() ran before the graceful Kill(), an
+// openfortivpn that needs a moment to tear the tunnel down cleanly would be
+// SIGKILLed mid-shutdown, defeating the SIGTERM->grace->SIGKILL escalation this
+// code implements.
+//
+// The child traps SIGTERM, sleeps briefly, then exits 42. Observing exit code
+// 42 proves the trap ran to completion — i.e. SIGTERM was honored and no
+// context-driven SIGKILL interrupted it. The sleep widens the window so the
+// old cancel()-first ordering would reliably SIGKILL the child instead.
+func TestController_Disconnect_GracefulBeforeContextCancel(t *testing.T) {
+	oldGrace := sigtermGracePeriod
+	sigtermGracePeriod = 2 * time.Second
+	defer func() { sigtermGracePeriod = oldGrace }()
+
+	c := NewController("unused", WithDirectMode())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	proc, err := NewDirectExecutor().CreateProcess(ctx, "sh", "-c",
+		`trap 'sleep 0.3; exit 42' TERM; while true; do sleep 0.05; done`)
+	require.NoError(t, err)
+	require.NoError(t, proc.Start())
+
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- proc.Wait() }()
+
+	// Let the shell install its SIGTERM trap before we signal it.
+	time.Sleep(200 * time.Millisecond)
+
+	// Wire the live process into the controller as if Connect had started it.
+	c.mu.Lock()
+	c.state = StateConnected
+	c.process = proc
+	c.ctx = ctx
+	c.cancel = cancel
+	c.mu.Unlock()
+
+	require.NoError(t, c.Disconnect(context.Background()))
+
+	select {
+	case err := <-waitErr:
+		var exitErr *exec.ExitError
+		require.ErrorAs(t, err, &exitErr, "process should exit via its SIGTERM trap, not SIGKILL")
+		assert.Equal(t, 42, exitErr.ExitCode(),
+			"SIGTERM must reach the process and its trap run to completion before the context is cancelled")
+	case <-time.After(5 * time.Second):
+		t.Fatal("process did not exit after Disconnect")
+	}
 }
