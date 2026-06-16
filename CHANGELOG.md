@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-06-16
+
 ### Added
 
 - Application icons (XDG hicolor set) are now installed by the deb and rpm
@@ -25,4 +27,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`NoNewPrivileges`, namespace/syscall/address-family restrictions,
   `MemoryDenyWriteExecute`, and related protections).
 
-[Unreleased]: https://github.com/shini4i/openfortivpn-gui/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/shini4i/openfortivpn-gui/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/shini4i/openfortivpn-gui/compare/v0.3.3...v0.3.4
