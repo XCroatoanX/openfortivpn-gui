@@ -44,7 +44,7 @@ A NixOS module is also available for declarative configuration.
 
 
 ### Arch
-> [!WARNING]
+> [!NOTE]
 This package is not officially maintained by the author. For questions or issues, please open an issue on the AUR package page, not this repository.
 
 Install package from AUR
@@ -77,7 +77,7 @@ sudo systemctl enable --now openfortivpn-gui-helper
 
 ### Debian/Ubuntu
 
-> [!NOTE]
+> [!WARNING]
 Requires libadwaita 1.7+, available on Debian 13 (Trixie) and later, and Ubuntu 25.04 and later. Older releases (e.g. Ubuntu 24.04 LTS) ship an incompatible libadwaita and are not supported.
 
 Download the `.deb` package from [GitHub Releases](https://github.com/shini4i/openfortivpn-gui/releases):
