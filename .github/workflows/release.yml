@@ -27,7 +27,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            git gcc pkg-config ca-certificates \
+            git gcc pkg-config ca-certificates curl gettext-base \
             libgtk-4-dev libadwaita-1-dev libsecret-1-dev gobject-introspection
 
       - name: Checkout
